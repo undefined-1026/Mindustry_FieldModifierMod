@@ -40,13 +40,13 @@ ext{
     // - latest: depend on the latest release of mindustry
     // - be: depend on the very latest commit of mindustry
     // - v<number>: depend on a specific commit
-    mindustryVersion = "v158.1"
+    mindustryVersion = "v158"
     isWindows = System.getProperty("os.name").toLowerCase().contains("windows")
     sdkRoot = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
 }
 
 dependencies{
-    compileOnly mindustryVersion == "be" ? "Anuken:MindustryBuilds:latest" : "Anuken:Mindustry:$mindustryVersion"
+    compileOnly "Anuken:Mindustry:$mindustryVersion"
 }
 
 tasks.register('jarAndroid'){
@@ -80,6 +80,7 @@ jar{
 
     from(projectDir){
         include "mod.hjson"
+        include "icon.png"
     }
 
     from("assets/"){
