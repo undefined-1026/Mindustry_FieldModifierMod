@@ -1,6 +1,7 @@
 package mod;
 
 import arc.Core;
+import arc.audio.Sound;
 import arc.func.Cons2;
 import arc.graphics.*;
 import arc.input.KeyCode;
@@ -14,11 +15,14 @@ import arc.struct.*;
 
 import arc.util.*;
 import mindustry.Vars;
+import mindustry.content.Items;
+import mindustry.content.Liquids;
 import mindustry.gen.*;
 import mindustry.graphics.*;
 import mindustry.type.Item;
 import mindustry.type.Liquid;
 import mindustry.ui.*;
+import rhino.*;
 
 import java.lang.reflect.*;
 import java.util.*;
@@ -30,6 +34,8 @@ public class ObjectInspector extends Table {
     private static final float panelWidth = 420f;
     private static final float panelHeight = 520f;
     private static final int maxDepth = 8;
+    private final ReflectUtil r = new ReflectUtil();
+
     public int Object = -1;
     public int changes = 0;
     public Stack<ObjectPage> pages=  new Stack<>();
@@ -649,7 +655,8 @@ public class ObjectInspector extends Table {
                 editingArrayIndex = -1;
                 editingArrayComponentType = null;
                 buildEditArea();
-            }).size(24f).padLeft(4f);
+            }).size(24f).pad(4f);
+            t.button(Icon.edit, Styles.cleari, this::showScriptDialog).size(24f).pad(4f);
             t.row();
 
             // 当前值
@@ -935,6 +942,278 @@ public class ObjectInspector extends Table {
             this.target = target;
             this.paneY = paneY;
             this.opens = opens;
+        }
+    }
+
+    /** 打开脚本对话框 */
+    private void showScriptDialog(){
+        final boolean isArrayMode = editingArray != null;
+        if(!isArrayMode && (selectedField == null || selectedTarget == null)) return;
+
+        // 快照当前编辑上下文，避免对话框回调时状态被覆盖
+        final Object finalArray    = editingArray;
+        final int    finalArrayIdx = editingArrayIndex;
+        final Class<?> finalType   = isArrayMode ? editingArrayComponentType : selectedField.getType();
+        final Field  finalField    = isArrayMode ? null : selectedField;
+        final Object finalTarget   = isArrayMode ? editingArray : selectedTarget;
+        final String finalName     = isArrayMode ? ("[" + editingArrayIndex + "]") : selectedField.getName();
+
+        Object curVal;
+        try {
+            curVal = isArrayMode
+                    ? java.lang.reflect.Array.get(finalArray, finalArrayIdx)
+                    : finalField.get(finalTarget);
+        } catch(Exception e){
+            curVal = null;
+        }
+        final Object finalCurrent = curVal;
+
+        Dialog dialog = new Dialog();
+        dialog.title.setText("JS 脚本 - " + finalName);
+
+        TextArea area = new TextArea("");
+        area.setMessageText("例如: content.item(\"copper\") \ntarget.kill()\nr.getStatic(Items,\"copper\")");
+        area.setPrefRows(6);
+
+        Label result = new Label("");
+        result.setWrap(true);
+        result.setColor(Color.lightGray);
+
+        dialog.cont.add("字段类型: ").color(Color.gray).left();
+        dialog.cont.add(simplifyType(finalType)).color(Pal.accent).left().row();
+
+        dialog.cont.add("当前值: ").color(Color.gray).left();
+        dialog.cont.add(formatValue(finalCurrent)).color(Color.lightGray).left().row();
+
+        dialog.cont.add("可用变量:r, target, value, field, content, Vars, Vec2, Color, Mathf, Item, Liquid")
+                .color(Color.darkGray).fontScale(0.75f).colspan(2).left().padTop(4f).row();
+
+        dialog.cont.add(area).growX().height(120f).colspan(2).pad(4f).row();
+        dialog.cont.add(result).growX().colspan(2).left().pad(4f).row();
+
+        dialog.cont.table(btns -> {
+            btns.button("运行并应用", Icon.ok, () -> {
+                try {
+                    Object jsRes = evalScript(area.getText(), finalTarget, finalCurrent, finalType, finalField);
+
+                    if(jsRes == null || jsRes == Context.getUndefinedValue()){
+                        applyScriptResult(null, finalType,
+                                isArrayMode, finalArray, finalArrayIdx, finalField, finalTarget);
+                        result.setText("结果: null（已应用）");
+                        result.setColor(Color.orange);
+                        refresh();
+                        return;
+                    }
+
+                    Object coerced = coerceToType(jsRes, finalType);
+                    applyScriptResult(coerced, finalType,
+                            isArrayMode, finalArray, finalArrayIdx, finalField, finalTarget);
+
+                    result.setText("成功: " + formatValue(coerced));
+                    result.setColor(Color.lime);
+                    refresh();
+                } catch(Throwable e){
+                    result.setText(e.getClass().getSimpleName() + ": " + e.getMessage());
+                    result.setColor(Color.scarlet);
+                    Log.err(e);
+                }
+            }).size(140f, 40f).pad(4f);
+
+            btns.button("仅运行", Icon.play, () -> {
+                try {
+                    Object jsRes = evalScript(area.getText(), finalTarget, finalCurrent, finalType, finalField);
+                    Object display = (jsRes == null || jsRes == Context.getUndefinedValue())
+                            ? null : Context.jsToJava(jsRes, Object.class);
+                    result.setText("结果: " + formatValue(display));
+                    result.setColor(Color.lightGray);
+                } catch(Throwable e){
+                    result.setText(e.getClass().getSimpleName() + ": " + e.getMessage());
+                    result.setColor(Color.scarlet);
+                    Log.err(e);
+                }
+            }).size(120f, 40f).pad(4f);
+
+            btns.button("关闭", dialog::hide).size(100f, 40f).pad(4f);
+        }).growX().padTop(4f).row();
+
+        dialog.show();
+    }
+
+    /** 在 Rhino 里执行脚本，返回原始 JS 结果 */
+    private Object evalScript(String script, Object targetObj, Object value,
+                              Class<?> expectedType, Field field){
+        Context cx = Context.getCurrentContext();
+        boolean newContext = cx == null;
+        if(newContext) cx = Context.enter();
+
+        try{
+            cx.setOptimizationLevel(-1);
+            cx.setLanguageVersion(Context.VERSION_ES6);
+
+            Scriptable scope = cx.initStandardObjects();
+            ScriptableObject.putProperty(scope, "r",  Context.javaToJS(this.r, scope));
+
+            ScriptableObject.putProperty(scope, "target",  Context.javaToJS(targetObj, scope));
+            ScriptableObject.putProperty(scope, "value",   Context.javaToJS(value, scope));
+            ScriptableObject.putProperty(scope, "field",   Context.javaToJS(field, scope));
+            ScriptableObject.putProperty(scope, "type",    Context.javaToJS(expectedType, scope));
+            ScriptableObject.putProperty(scope, "content", Context.javaToJS(Vars.content, scope));
+            ScriptableObject.putProperty(scope, "Vars",    Context.javaToJS(Vars.class, scope));
+
+            // 常用工具类，脚本里可以直接 new / 调用
+            ScriptableObject.putProperty(scope, "Vec2",   Context.javaToJS(Vec2.class,   scope));
+            ScriptableObject.putProperty(scope, "Color",  Context.javaToJS(Color.class,  scope));
+            ScriptableObject.putProperty(scope, "Mathf",  Context.javaToJS(Mathf.class,  scope));
+            ScriptableObject.putProperty(scope, "Item",   Context.javaToJS(Item.class,   scope));
+            ScriptableObject.putProperty(scope, "Items", Context.javaToJS(Items.class, scope));
+            ScriptableObject.putProperty(scope, "Liquid", Context.javaToJS(Liquid.class, scope));
+            ScriptableObject.putProperty(scope, "Liquids", Context.javaToJS(Liquids.class, scope));
+            ScriptableObject.putProperty(scope, "Sound", Context.javaToJS(Sound.class, scope));
+            ScriptableObject.putProperty(scope, "Sounds", Context.javaToJS(Sounds.class, scope));
+
+            return cx.evaluateString(scope, script, "field-script", 1);
+        } finally {
+            if(newContext) Context.exit();
+        }
+    }
+
+    /** 把 JS 结果尽量转成目标 Java 类型 */
+    private Object coerceToType(Object jsResult, Class<?> type){
+        if(jsResult == null || jsResult == Context.getUndefinedValue()
+                || jsResult == Scriptable.NOT_FOUND) return null;
+
+        if(type.isInstance(jsResult)) return jsResult;
+
+        try{
+            return Context.jsToJava(jsResult, type);
+        }catch(Throwable e){
+            Log.err("coerce failed to " + type.getSimpleName(), e);
+            return jsResult; // 交给 Field.set / Array.set 去抛异常
+        }
+    }
+
+    /** 把结果写回字段或数组元素 */
+    private void applyScriptResult(Object result, Class<?> type,
+                                   boolean isArray, Object arr, int arrIdx,
+                                   Field field, Object targetObj){
+        try{
+            if(isArray){
+                if(result == null && type.isPrimitive()){
+                    Log.warn("Cannot set primitive array element to null");
+                    return;
+                }
+                java.lang.reflect.Array.set(arr, arrIdx, result);
+            } else if(field != null && targetObj != null){
+                field.setAccessible(true);
+                field.set(targetObj, result);
+            }
+        }catch(Throwable e){
+            Log.err("apply script result failed", e);
+        }
+    }
+    public class ReflectUtil {
+        public ReflectUtil(){}
+
+        private static Class<?> cls(Object c){
+            if(c instanceof Class) return (Class<?>)c;
+            if(c instanceof String){
+                try { return Class.forName((String)c); }
+                catch(ClassNotFoundException e){ throw new RuntimeException(e); }
+            }
+            return c.getClass();
+        }
+
+        private static Field findField(Class<?> c, String name){
+            while(c != null){
+                try { return c.getDeclaredField(name); }
+                catch(NoSuchFieldException ignored){}
+                c = c.getSuperclass();
+            }
+            throw new RuntimeException("No field: " + name);
+        }
+
+        private static Method findMethod(Class<?> c, String name, Object[] args, boolean isStatic){
+            Class<?>[] types = new Class<?>[args == null ? 0 : args.length];
+            for(int i = 0; i < types.length; i++){
+                types[i] = args[i] == null ? null : args[i].getClass();
+            }
+            while(c != null){
+                for(Method m : c.getDeclaredMethods()){
+                    if(!m.getName().equals(name)) continue;
+                    if(Modifier.isStatic(m.getModifiers()) != isStatic) continue;
+                    Class<?>[] ps = m.getParameterTypes();
+                    if(ps.length != types.length) continue;
+                    boolean ok = true;
+                    for(int i = 0; i < ps.length; i++){
+                        if(types[i] != null && !box(ps[i]).isAssignableFrom(types[i])){ ok = false; break; }
+                    }
+                    if(ok) return m;
+                }
+                c = c.getSuperclass();
+            }
+            throw new RuntimeException("No method: " + name);
+        }
+
+        private static Class<?> box(Class<?> c){
+            if(c == int.class) return Integer.class;
+            if(c == long.class) return Long.class;
+            if(c == float.class) return Float.class;
+            if(c == double.class) return Double.class;
+            if(c == boolean.class) return Boolean.class;
+            if(c == byte.class) return Byte.class;
+            if(c == short.class) return Short.class;
+            if(c == char.class) return Character.class;
+            return c;
+        }
+
+        // ---------- 对外方法 ----------
+
+        public Object getStatic(Object cls, String name){
+            try {
+                Field f = findField(cls(cls), name);
+                f.setAccessible(true);
+                return f.get(null);
+            } catch(Exception e){ Log.err(e); return null; }
+        }
+
+        public void setStatic(Object cls, String name, Object val){
+            try {
+                Field f = findField(cls(cls), name);
+                f.setAccessible(true);
+                f.set(null, val);
+            } catch(Exception e){ Log.err(e); }
+        }
+
+        public Object callStatic(Object cls, String name, Object[] args){
+            try {
+                Method m = findMethod(cls(cls), name, args, true);
+                m.setAccessible(true);
+                return m.invoke(null, args);
+            } catch(Exception e){ Log.err(e); return null; }
+        }
+
+        public Object getField(Object obj, String name){
+            try {
+                Field f = findField(obj.getClass(), name);
+                f.setAccessible(true);
+                return f.get(obj);
+            } catch(Exception e){ Log.err(e); return null; }
+        }
+
+        public void setField(Object obj, String name, Object val){
+            try {
+                Field f = findField(obj.getClass(), name);
+                f.setAccessible(true);
+                f.set(obj, val);
+            } catch(Exception e){ Log.err(e); }
+        }
+
+        public Object call(Object obj, String name, Object[] args){
+            try {
+                Method m = findMethod(obj.getClass(), name, args, false);
+                m.setAccessible(true);
+                return m.invoke(obj, args);
+            } catch(Exception e){ Log.err(e); return null; }
         }
     }
 }
